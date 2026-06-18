@@ -554,7 +554,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
-    tools_for_api = agent.tools
+    # Request-time schema narrowing must never mutate the canonical per-agent
+    # registry.  The conversation loop may set an effective tools list for the
+    # current provider request; fall back to the full registry when absent.
+    _effective_tools = getattr(agent, "_effective_tools_for_current_request", None)
+    tools_for_api = _effective_tools if _effective_tools is not None else agent.tools
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()

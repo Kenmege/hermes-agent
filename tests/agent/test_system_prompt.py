@@ -67,6 +67,34 @@ def _stable_prompt(agent):
         return build_system_prompt_parts(agent)["stable"]
 
 
+class TestMemoryRailGuidance:
+    def test_context_mode_guidance_injected_when_ctx_tools_loaded(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=["mcp_context_mode_ctx_execute", "mcp_context_mode_ctx_search"]))
+        assert "Context-mode as the context-window management rail" in stable
+        assert "mcp_context_mode_ctx_batch_execute" in stable
+        assert "Do not use context-mode as a substitute for required verification" in stable
+
+    def test_byterover_guidance_injected_when_brv_tools_loaded(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=["brv_query", "brv_curate"]))
+        assert "ByteRover as the implementation-memory rail" in stable
+        assert "Linear remains execution state" in stable
+        assert "Obsidian remains human-readable" in stable
+
+    def test_linear_guidance_uses_actual_mcp_tool_names(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=["mcp_linear_get_issue", "mcp_linear_save_issue", "mcp_linear_save_comment"]))
+        assert "Linear as the execution-state rail" in stable
+        assert "mcp_linear_save_issue" in stable
+        assert "mcp_linear_save_comment" in stable
+        assert "mcp_linear_update_issue" not in stable
+        assert "mcp_linear_create_comment" not in stable
+
+    def test_obsidian_guidance_keeps_default_as_orchestrator_not_spoofed_writer(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=["mcp_empire_registry_obsidian_read", "mcp_empire_registry_obsidian_write"]))
+        assert "main/default Hermes profile remains" in stable
+        assert "do not spoof another caller" in stable.lower()
+        assert "caller` is your real profile/role id" in stable
+
+
 class TestCodingContextBlock:
     def test_injected_when_active(self, monkeypatch, tmp_path):
         import subprocess

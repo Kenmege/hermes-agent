@@ -35,11 +35,15 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
+    CONTEXT_MODE_GUIDANCE,
+    BYTE_ROVER_KNOWLEDGE_GUIDANCE,
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    LINEAR_EXECUTION_GUIDANCE,
+    OBSIDIAN_KNOWLEDGE_GUIDANCE,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -221,10 +225,48 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
         )
-    else:
-        skills_prompt = ""
-    if skills_prompt:
-        stable_parts.append(skills_prompt)
+        if skills_prompt:
+            stable_parts.append(skills_prompt)
+
+    # Context-mode token/context hygiene guidance — only when the MCP tools are
+    # actually present. This prevents large-output audits from bloating the
+    # live conversation when a derivation/index/search path is available.
+    has_context_mode_tools = any(
+        name.startswith("mcp_context_mode_ctx_") or name.startswith("ctx_")
+        for name in agent.valid_tool_names
+    )
+    if has_context_mode_tools:
+        stable_parts.append(CONTEXT_MODE_GUIDANCE)
+
+    # ByteRover implementation-memory guidance — only when the brv tools are
+    # available. This keeps the prompt lean for profiles without ByteRover while
+    # making the active rail explicit for the main Hermes orchestrator.
+    has_byterover_tools = any(
+        name in {"brv_query", "brv_curate", "brv_status"}
+        for name in agent.valid_tool_names
+    )
+    if has_byterover_tools:
+        stable_parts.append(BYTE_ROVER_KNOWLEDGE_GUIDANCE)
+
+    # Linear execution-state guidance — only when Linear MCP tools are actually
+    # available to this agent (gated like the skills block above). Without this,
+    # the model registers Linear's tools but never calls them.
+    has_linear_tools = any(
+        name.startswith("mcp_linear_") for name in agent.valid_tool_names
+    )
+    if has_linear_tools:
+        stable_parts.append(LINEAR_EXECUTION_GUIDANCE)
+
+    # Obsidian knowledge-rail guidance — only when the empire-registry obsidian
+    # tools are available. The write path exists + is policy-enforced, but
+    # without this nudge the model never calls it (the llm-wiki went stale).
+    has_obsidian_tools = any(
+        "empire_registry_obsidian_write" in name
+        or "empire_registry_obsidian_read" in name
+        for name in agent.valid_tool_names
+    )
+    if has_obsidian_tools:
+        stable_parts.append(OBSIDIAN_KNOWLEDGE_GUIDANCE)
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt

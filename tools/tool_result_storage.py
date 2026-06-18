@@ -99,6 +99,7 @@ def _build_persisted_message(
     has_more: bool,
     original_size: int,
     file_path: str,
+    ctx_indexed: bool = False,
 ) -> str:
     """Build the <persisted-output> replacement block."""
     size_kb = original_size / 1024
@@ -110,13 +111,96 @@ def _build_persisted_message(
     msg = f"{PERSISTED_OUTPUT_TAG}\n"
     msg += f"This tool result was too large ({original_size:,} characters, {size_str}).\n"
     msg += f"Full output saved to: {file_path}\n"
-    msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
-    msg += f"Preview (first {len(preview)} chars):\n"
+    msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n"
+    if ctx_indexed:
+        # Bridge: the persisted output is now also searchable via context-mode (ctx-),
+        # so the model can query it by content instead of re-reading the full file.
+        # This is what makes ctx- earn its keep on large tool results.
+        msg += (
+            "This output is also indexed for semantic search: use the `ctx_batch_execute` / "
+            "context-mode `search` tool with a query to retrieve relevant sections without "
+            "reading the whole file.\n"
+        )
+    msg += f"\nPreview (first {len(preview)} chars):\n"
     msg += preview
     if has_more:
         msg += "\n..."
     msg += f"\n{PERSISTED_OUTPUT_CLOSING_TAG}"
     return msg
+
+
+# ── context-mode bridge ────────────────────────────────────────────────
+# When a large tool result is persisted to the sandbox, ALSO index it into the
+# context-mode (ctx-) FTS5 knowledge base so it becomes searchable by content.
+# This is the bridge that makes ctx- actually engage on large outputs: instead of
+# the model re-reading a huge file, it can `search` the indexed content. Disabled
+# by default unless the context-mode binary is present; toggle off with
+# HERMES_CTX_BRIDGE=0. Failure is non-fatal — tool execution never breaks if ctx-
+# is unavailable.
+
+_CTX_BINARY_CANDIDATES = (
+    os.path.expanduser("~/.local/bin/context-mode"),
+    "/usr/local/bin/context-mode",
+)
+
+
+def _resolve_ctx_binary() -> str | None:
+    """Return the context-mode binary path if available, else None."""
+    env_bin = os.environ.get("HERMES_CTX_BINARY")
+    if env_bin and os.path.isfile(env_bin):
+        return env_bin
+    for candidate in _CTX_BINARY_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _index_to_context_mode(
+    sandbox_path: str,
+    tool_name: str,
+    tool_use_id: str,
+    env=None,
+) -> bool:
+    """Index a persisted tool-result file into context-mode's FTS5 store.
+
+    Runs `context-mode index <path>` so the spilled output becomes searchable.
+    Returns True if indexed, False otherwise. Never raises — ctx- is an
+    enhancement layer, not a dependency.
+    """
+    if os.environ.get("HERMES_CTX_BRIDGE", "1") == "0":
+        return False
+    # Only index local files (sandbox writes to remote backends aren't reachable
+    # by the local ctx- binary).
+    if not sandbox_path.startswith("/") or not os.path.isfile(sandbox_path):
+        return False
+    binary = _resolve_ctx_binary()
+    if binary is None:
+        return False
+    import subprocess
+    source_label = f"hermes-persisted:{tool_name}:{tool_use_id}"
+    cmd = [binary, "index", sandbox_path, "--source", source_label]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={**os.environ},
+        )
+        if result.returncode == 0:
+            logger.info(
+                "context-mode bridge: indexed persisted %s output (%s) -> ctx-",
+                tool_name, tool_use_id,
+            )
+            return True
+        logger.debug(
+            "context-mode bridge: index failed for %s (rc=%s): %s",
+            tool_use_id, result.returncode, result.stderr[:200],
+        )
+    except Exception as exc:
+        logger.debug("context-mode bridge: index error for %s: %s", tool_use_id, exc)
+    return False
 
 
 def maybe_persist_tool_result(
@@ -157,15 +241,31 @@ def maybe_persist_tool_result(
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
 
     if env is not None:
+        sandbox_ok = False
         try:
-            if _write_to_sandbox(content, remote_path, env):
-                logger.info(
-                    "Persisted large tool result: %s (%s, %d chars -> %s)",
-                    tool_name, tool_use_id, len(content), remote_path,
-                )
-                return _build_persisted_message(preview, has_more, len(content), remote_path)
+            sandbox_ok = _write_to_sandbox(content, remote_path, env)
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
+
+        if sandbox_ok:
+            logger.info(
+                "Persisted large tool result: %s (%s, %d chars -> %s)",
+                tool_name, tool_use_id, len(content), remote_path,
+            )
+            # Bridge: also index the persisted file into context-mode so it is
+            # searchable by content (not just a file the model must read_file).
+            # Deliberately OUTSIDE the sandbox-write try block: a bridge failure
+            # (even an unexpected one) must NEVER cause truncation-after-success,
+            # because the sandbox write already succeeded. The helper swallows
+            # its own errors, but this placement is belt-and-braces.
+            try:
+                ctx_indexed = _index_to_context_mode(remote_path, tool_name, tool_use_id, env)
+            except Exception as exc:
+                logger.debug("context-mode bridge error for %s: %s", tool_use_id, exc)
+                ctx_indexed = False
+            return _build_persisted_message(
+                preview, has_more, len(content), remote_path, ctx_indexed=ctx_indexed
+            )
 
     logger.info(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",

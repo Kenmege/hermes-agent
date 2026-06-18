@@ -42,6 +42,8 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    error=None,
+    failure_reason=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -352,6 +354,10 @@ def finalize_turn(
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
     }
+    if error is not None:
+        result["error"] = error
+    if failure_reason is not None:
+        result["failure_reason"] = failure_reason
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # If a /steer landed after the final assistant turn (no more tool

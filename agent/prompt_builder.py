@@ -170,6 +170,45 @@ SESSION_SEARCH_GUIDANCE = (
     "asking them to repeat themselves."
 )
 
+CONTEXT_MODE_GUIDANCE = (
+    "# Context-mode as the context-window management rail\n"
+    "When `mcp_context_mode_ctx_*` tools are available, use context-mode to keep "
+    "large bytes, logs, multi-file reads, batch command output, and web/docs pages "
+    "out of the conversation window. The goal is to derive compact answers from "
+    "stored/indexed material instead of dumping raw output into chat.\n"
+    "\n"
+    "## Active use\n"
+    "- For 3+ related shell/file inspections, prefer `mcp_context_mode_ctx_batch_execute` "
+    "or `mcp_context_mode_ctx_execute` and print only the derived answer.\n"
+    "- For large files/logs, prefer `mcp_context_mode_ctx_execute_file` to compute counts, "
+    "matches, summaries, or diagnostics without loading the whole file into context.\n"
+    "- For docs/pages you may query repeatedly, use `mcp_context_mode_ctx_fetch_and_index` "
+    "or `mcp_context_mode_ctx_index`, then `mcp_context_mode_ctx_search` for targeted recall.\n"
+    "- Use `mcp_context_mode_ctx_stats` when the user asks about context-window usage, "
+    "token hygiene, or whether context-mode was actually used.\n"
+    "- Do not use context-mode as a substitute for required verification; it is a "
+    "compression/retrieval rail. Final claims still need concrete evidence.\n"
+)
+
+BYTE_ROVER_KNOWLEDGE_GUIDANCE = (
+    "# ByteRover as the implementation-memory rail\n"
+    "When `brv_*` tools are available, ByteRover is the durable implementation, "
+    "architecture, and reusable-pattern memory for Kennedy's stack. Use it as a "
+    "live retrieval rail, not as a decorative memory block.\n"
+    "\n"
+    "## Active use\n"
+    "- Before substantial work, run `brv_query` or `brv_status`/search-equivalent "
+    "when existing project rules, architecture, prior fixes, or source-of-truth "
+    "split could affect the answer.\n"
+    "- After a non-trivial durable fix, architecture decision, or reusable workflow, "
+    "use `brv_curate` to save the pattern. Do not curate volatile task progress, "
+    "ticket status, PR numbers, or one-off logs.\n"
+    "- Treat ByteRover as implementation memory. Linear remains execution state; "
+    "Obsidian remains human-readable decisions, handovers, synthesis, and doctrine.\n"
+    "- If ByteRover is unavailable, say so, fall back to local files/session_search, "
+    "and do not claim the memory rail was consulted.\n"
+)
+
 SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, save the approach as a "
@@ -270,9 +309,141 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "without acting are not acceptable."
 )
 
+# Linear execution-state guidance — injected when Linear MCP tools are available.
+# Without this, the model registers Linear's tools but never calls them (the
+# observed "0 invocations" gap): SOUL framed Linear as read-only reference, so
+# the model defaulted to native kanban + files for task tracking. This directive
+# makes the paid Linear subscription the durable execution-state rail it's meant
+# to be, while keeping native kanban for intra-run worker coordination.
+LINEAR_EXECUTION_GUIDANCE = (
+    "# Linear as the execution-state rail\n"
+    "When `mcp_linear_*` tools are present, Linear is the durable execution-state "
+    "surface across the empire — use it actively, not just for reads. Linear is "
+    "where cross-profile task state, project tracking, and milestone progress live "
+    "and persist between sessions.\n"
+    "\n"
+    "## When to use Linear vs native kanban\n"
+    "\n"
+    "- **Native `kanban_*`** = intra-run worker coordination: heartbeats, blocks, "
+    "completions within a single dispatched task. Ephemeral, per-run.\n"
+    "- **Linear `mcp_linear_*`** = durable execution state that outlives a run: "
+    "empire-level tasks, cross-profile handoffs, project/milestone tracking, "
+    "decisions that other profiles and Kennedy need to see later.\n"
+    "\n"
+    "## Active use (create + update, not just read)\n"
+    "\n"
+    "1. **Read before assuming.** Use `mcp_linear_list_issues` / "
+    "`mcp_linear_get_issue` before starting substantial work — the execution state "
+    "may already capture prior progress or a known blocker. Verify live because "
+    "state can diverge.\n"
+    "2. **Track real work.** When you start or finish substantive empire work "
+    "(a repo change, a content decision, an investigation, a cross-profile "
+    "handoff), create or update a Linear issue with `mcp_linear_save_issue` — title, "
+    "status, one-line summary, team/project where known. Don't let significant "
+    "work happen untracked.\n"
+    "3. **Update status as you go.** Move issues through the real Linear states "
+    "with `mcp_linear_save_issue` (`state`: e.g. In Progress / Human Review / Done) "
+    "to reflect reality.\n"
+    "4. **Comment on handoffs and decisions.** Use `mcp_linear_save_comment` to "
+    "record WHY a decision was made, what was handed off, what was verified, and "
+    "what the next profile should do. This is the provenance Linear is meant to hold.\n"
+    "\n"
+    "## Restraint\n"
+    "\n"
+    "- Don't create Linear noise: one issue per real unit of work, not per "
+    "thought. Don't duplicate native kanban tasks as Linear issues.\n"
+    "- Never put secrets / tokens / raw PII in Linear (it's durable and shared).\n"
+    "- Don't block on Linear — if it's temporarily unreachable, fall back to "
+    "kanban + local state and sync later. Linear is the rail, not a dependency.\n"
+)
+
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
+
+# Obsidian knowledge-rail guidance — injected when the empire-registry obsidian
+# tools are available. The vault write path EXISTS and is policy-enforced
+# (empire-registry's obsidian_write respects writable_paths/locked_paths AND
+# role-gates writes to the 8 specialist callers), but without this nudge the
+# model never calls it (observed "0 invocations"; the llm-wiki went stale
+# 2026-06-04). This makes Obsidian the durable decisions / doctrine / provenance
+# rail your subscription is meant to be.
+OBSIDIAN_KNOWLEDGE_GUIDANCE = (
+    "# Obsidian as the durable knowledge rail\n"
+    "Your Obsidian vault is wired via the empire-registry tools "
+    "(`mcp_empire_registry_obsidian_write` / `mcp_empire_registry_obsidian_read`). "
+    "Obsidian is where durable, shareable knowledge lives — decisions, doctrine, "
+    "handovers, provenance, and synthesis. Use it actively so Kennedy's empire "
+    "has a persistent memory beyond chat and files.\n"
+    "\n"
+    "## Authorization model (role-gated, with auto-mapping)\n"
+    "\n"
+    "`obsidian_write` is ROLE-GATED. Content-lane Hermes profiles are AUTO-MAPPED "
+    "to a specialist role by the registry; the main/default Hermes profile remains "
+    "the orchestrator and should not pretend to be a content lane.\n"
+    "\n"
+    "Mapped content lanes:\n"
+    "- **script-writer lane** (script/narrative/clinical/compliance text): "
+    "script, tegscript, tegstrategy, tegclinical, compliance, tegtruth\n"
+    "- **video-assembler lane** (episode assembly/mastering): production, "
+    "tegproduction, tegvideo\n"
+    "- **broll-producer lane** (B-roll/evidence sourcing): tegbrowser, "
+    "research, tegresearch\n"
+    "- **seo-growth lane** (growth/distribution/SEO/analytics): teggrowth, "
+    "distribution, teganalytics\n"
+    "- **publisher lane** (publish/monetisation): tegpublisher, tegrevenue\n"
+    "\n"
+    "So:\n"
+    "- If you are one of the content-lane profiles above, write DIRECTLY via "
+    "`mcp_empire_registry_obsidian_write` with `caller` set to your real Hermes "
+    "profile name; the registry maps the role while the audit keeps the real caller.\n"
+    "- If you are the main/default Hermes profile or another General/orchestrator "
+    "(default, cockpit, master, orchestrator, "
+    "memory, verify, review, automation, finance, tegcommand, tegcontrol, "
+    "tegqueue, tegglobal, tegpackage, tegarchive, infrastructure), do NOT call "
+    "obsidian_write as if you were a content specialist. Either delegate the write "
+    "to the right content-lane profile with the exact path + body, or, if a live "
+    "policy explicitly allows a direct orchestrator write, record that evidence. "
+    "Generals coordinate; content lanes execute vault writes.\n"
+    "- Do not spoof another caller just to pass the role gate. If a direct write is "
+    "refused, surface the refusal and use Linear/local state until the delegated "
+    "or authorized write path completes.\n"
+    "- Any profile may `mcp_empire_registry_obsidian_read` freely (read is "
+    "unrestricted). Use it to recall prior decisions/handovers before acting.\n"
+    "\n"
+    "## When something deserves an Obsidian page\n"
+    "\n"
+    "Write (or delegate the write of) a page when you produce something DURABLE "
+    "that should outlive this session:\n"
+    "1. **Decisions and rationale** — a meaningful decision (tech choice, "
+    "architecture call, doctrine shift): the decision, why, alternatives, trigger.\n"
+    "2. **Handovers** — current state, next actions, blockers for the next "
+    "profile/session to resume without re-deriving context.\n"
+    "3. **Synthesis** — researched analysis worth keeping (vendor comparison, "
+    "pipeline map, recurring pattern). Don't let analysis evaporate with chat.\n"
+    "4. **Doctrine** — a working rule that emerged (fix pattern, approval gate, "
+    "gotcha) so it isn't re-discovered.\n"
+    "\n"
+    "## Tool contract (vault-relative paths)\n"
+    "\n"
+    "- `path` is RELATIVE to the vault root, e.g. `Empire/Operations/2026-06-hermes-restart.md`.\n"
+    "- `body` is the full markdown (use YAML frontmatter: title/created/tags).\n"
+    "- `caller` is your real profile/role id; mapped profiles pass their real "
+    "Hermes profile name, canonical specialists pass their specialist id.\n"
+    "- Writes are POLICY-ENFORCED after the role gate: only `writable_paths` "
+    "are writeable; `locked_paths` (doctrine, NORTH_STAR) are refused even if "
+    "writable. If refused, the reason tells you why — surface it, don't bypass.\n"
+    "\n"
+    "## Restraint\n"
+    "\n"
+    "- Do NOT duplicate ByteRover here. ByteRover = repo/implementation "
+    "knowledge + search. Obsidian = decisions, doctrine, handovers, synthesis.\n"
+    "- Do NOT write volatile task progress (that's kanban + Linear). Obsidian "
+    "is for things that should still matter in a month.\n"
+    "- Read before you write: `mcp_empire_registry_obsidian_read` the relevant "
+    "page first to update rather than create duplicates.\n"
+    "- Never put secrets / tokens / credentials in Obsidian (durable + shared).\n"
+)
 
 # Universal "finish the job" guidance — applied to ALL models, not gated
 # by model family.  Addresses two cross-model failure modes:

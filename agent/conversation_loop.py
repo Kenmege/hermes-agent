@@ -144,6 +144,97 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
     )
 
 
+def _maybe_compress_before_api_call(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    *,
+    system_message: Optional[str],
+    active_system_prompt: Optional[str],
+    conversation_history: Optional[List[Dict[str, Any]]],
+    approx_request_tokens: int,
+    effective_task_id: str,
+    compression_attempts: int,
+    max_compression_attempts: int,
+    api_call_count: int,
+) -> Dict[str, Any]:
+    """Optionally compress between tool/API iterations before the next request.
+
+    ``build_turn_context`` already performs once-per-turn preflight compression,
+    but long tool outputs can push a later in-turn API request over the soft
+    threshold.  This helper is deliberately side-effect-light except for the
+    same retry/stream state reset that the existing compression paths perform.
+    """
+    result: Dict[str, Any] = {
+        "compressed": False,
+        "exhausted": False,
+        "messages": messages,
+        "conversation_history": conversation_history,
+        "active_system_prompt": active_system_prompt,
+        "compression_attempts": compression_attempts,
+    }
+
+    if not getattr(agent, "compression_enabled", False):
+        return result
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return result
+
+    should_defer = getattr(
+        compressor,
+        "should_defer_preflight_to_real_usage",
+        lambda _tokens: False,
+    )
+    try:
+        if should_defer(approx_request_tokens):
+            return result
+        should_compress = compressor.should_compress(approx_request_tokens)
+    except Exception:
+        logger.debug("in-turn compression guard failed to evaluate", exc_info=True)
+        return result
+
+    if not should_compress:
+        return result
+    if compression_attempts >= max_compression_attempts:
+        result["exhausted"] = True
+        return result
+
+    status = (
+        f"📦 In-turn compression before API call #{api_call_count}: "
+        f"~{approx_request_tokens:,} tokens >= "
+        f"{getattr(compressor, 'threshold_tokens', 'threshold')} threshold."
+    )
+    try:
+        emit = getattr(agent, "_emit_status", None) or getattr(agent, "_buffer_status", None)
+        if emit:
+            emit(status)
+    except Exception:
+        pass
+
+    compressed_messages, compressed_system_prompt = agent._compress_context(
+        messages,
+        system_message,
+        approx_tokens=approx_request_tokens,
+        task_id=effective_task_id,
+    )
+    if len(compressed_messages) >= len(messages):
+        return result
+
+    agent._empty_content_retries = 0
+    agent._thinking_prefill_retries = 0
+    agent._last_content_with_tools = None
+    agent._last_content_tools_all_housekeeping = False
+    agent._mute_post_response = False
+
+    result.update({
+        "compressed": True,
+        "messages": compressed_messages,
+        "conversation_history": None,
+        "active_system_prompt": compressed_system_prompt,
+        "compression_attempts": compression_attempts + 1,
+    })
+    return result
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.handle_function_call`` / ``run_agent._set_interrupt`` /
@@ -545,6 +636,8 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    _terminal_error = None
+    _terminal_failure_reason = None
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -859,6 +952,35 @@ def run_conversation(
         approx_request_tokens = estimate_request_tokens_rough(
             api_messages, tools=agent.tools or None
         )
+
+        _in_turn_compression = _maybe_compress_before_api_call(
+            agent,
+            messages,
+            system_message=system_message,
+            active_system_prompt=active_system_prompt,
+            conversation_history=conversation_history,
+            approx_request_tokens=approx_request_tokens,
+            effective_task_id=effective_task_id,
+            compression_attempts=compression_attempts,
+            max_compression_attempts=max_compression_attempts,
+            api_call_count=api_call_count,
+        )
+        if _in_turn_compression["compressed"]:
+            messages = _in_turn_compression["messages"]
+            conversation_history = _in_turn_compression["conversation_history"]
+            active_system_prompt = _in_turn_compression["active_system_prompt"]
+            compression_attempts = _in_turn_compression["compression_attempts"]
+            for _idx in range(len(messages) - 1, -1, -1):
+                if messages[_idx].get("role") == "user":
+                    current_turn_user_idx = _idx
+                    break
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            continue
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, approx_request_tokens
@@ -3394,15 +3516,14 @@ def run_conversation(
                         agent._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )
-                    agent._persist_session(messages, conversation_history)
                     if classified.reason == FailoverReason.billing:
-                        _final_response = f"Billing or credits exhausted: {_final_summary}"
+                        final_response = f"Billing or credits exhausted: {_final_summary}"
                         if _billing_guidance:
-                            _final_response += f"\n\n{_billing_guidance}"
+                            final_response += f"\n\n{_billing_guidance}"
                     else:
-                        _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
+                        final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                     if _is_stream_drop:
-                        _final_response += (
+                        final_response += (
                             "\n\nThe provider's stream connection keeps "
                             "dropping — this often happens when generating "
                             "very large tool call responses (e.g. write_file "
@@ -3410,20 +3531,12 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
-                    return {
-                        "final_response": _final_response,
-                        "messages": messages,
-                        "api_calls": api_call_count,
-                        "completed": False,
-                        "failed": True,
-                        "error": _final_summary,
-                        # Surface the classified reason so callers (notably the
-                        # kanban worker path in cli.py) can distinguish a
-                        # transient throttle from a real failure and choose a
-                        # different exit code. ``rate_limit`` / ``billing`` here
-                        # mean "quota wall, not a task error".
-                        "failure_reason": classified.reason.value,
-                    }
+                    failed = True
+                    _terminal_error = _final_summary
+                    _terminal_failure_reason = classified.reason.value
+                    _turn_exit_reason = f"api_failed_after_{max_retries}_retries({classified.reason.value})"
+                    messages.append({"role": "assistant", "content": final_response})
+                    break
 
                 # For rate limits, respect the Retry-After header if present
                 _retry_after = None
@@ -3505,6 +3618,12 @@ def run_conversation(
             _boost_cap = max(32768, _requested_cap or 0)
             agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
             continue
+
+        if failed and final_response is not None and _terminal_error is not None:
+            # A terminal API failure has already been converted into a normal
+            # assistant message. Exit the tool loop through finalize_turn so
+            # cleanup, diagnostics, persistence, and external-memory hooks run.
+            break
 
         # Guard: if all retries exhausted without a successful response
         # (e.g. repeated context-length errors that exhausted retry_count),
@@ -4473,6 +4592,8 @@ def run_conversation(
         original_user_message=original_user_message,
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
+        error=_terminal_error,
+        failure_reason=_terminal_failure_reason,
     )
 
 

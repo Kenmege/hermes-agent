@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+from collections import deque
 import json
 import logging
 import socket
@@ -34,10 +35,11 @@ from tui_gateway import server
 
 _log = logging.getLogger(__name__)
 
-# Max seconds a pool-dispatched handler will block waiting for the event loop
-# to flush a WS frame before we mark the transport dead. Protects handler
-# threads from a wedged socket.
-_WS_WRITE_TIMEOUT_S = 10.0
+# Queue limits for slow-but-alive WebSocket clients. Writers must never block on
+# token/status streaming; under pressure we shed only droppable progress frames
+# while preserving final responses, errors, approvals, and JSON-RPC replies.
+_WS_QUEUE_SOFT_MAX = 256
+_WS_QUEUE_HARD_MAX = 1024
 _WS_LOG_PAYLOAD_PREVIEW = 240
 
 # Keep starlette optional at import time; handle_ws uses the real class when
@@ -48,20 +50,34 @@ except ImportError:  # pragma: no cover - starlette is a required install path
     _WebSocketDisconnect = Exception  # type: ignore[assignment]
 
 
+def _is_droppable_frame(obj: Any) -> bool:
+    """Return True for high-volume progress frames safe to shed under pressure."""
+    if not isinstance(obj, dict):
+        return False
+    # JSON-RPC replies carry an id and must always be delivered.
+    if "id" in obj:
+        return False
+    if obj.get("method") != "event":
+        return False
+    params = obj.get("params")
+    if not isinstance(params, dict):
+        return False
+    event_type = str(params.get("type") or "")
+    return event_type in {
+        "message.delta",
+        "thinking.delta",
+        "status.update",
+    }
+
+
 class WSTransport:
-    """Per-connection WS transport.
+    """Per-connection WS transport with non-blocking queued writes.
 
-    ``write`` is safe to call from any thread *other than* the event loop
-    thread that owns the socket. Pool workers (the only real caller) run in
-    their own threads, so marshalling onto the loop via
-    :func:`asyncio.run_coroutine_threadsafe` + ``future.result()`` is correct
-    and deadlock-free there.
-
-    When called from the loop thread itself (e.g. by ``handle_ws`` for an
-    inline response) the same call would deadlock: we'd schedule work onto
-    the loop we're currently blocking. We detect that case and fire-and-
-    forget instead. Callers that need to know when the bytes are on the wire
-    should use :meth:`write_async` from the loop thread.
+    Pool-thread writes must not block on a slow GUI/Desktop client. Frames are
+    marshalled onto the owning event loop and drained by one writer task. When a
+    client is slow-but-alive we shed only droppable progress frames beyond the
+    soft cap; essential frames are preserved until the hard cap, where the
+    transport is declared dead to avoid unbounded memory growth.
     """
 
     def __init__(
@@ -75,71 +91,103 @@ class WSTransport:
         self._loop = loop
         self._peer = peer
         self._closed = False
+        self._queue = deque()
+        self._writer_task: asyncio.Task | None = None
+        self.dropped_frames = 0
 
     def write(self, obj: dict) -> bool:
         if self._closed:
             return False
-
         line = json.dumps(obj, ensure_ascii=False)
-
         try:
             on_loop = asyncio.get_running_loop() is self._loop
         except RuntimeError:
             on_loop = False
 
         if on_loop:
-            # Fire-and-forget — don't block the loop waiting on itself.
-            self._loop.create_task(self._safe_send(line))
-            return True
+            return self._enqueue(line, obj, None)
 
+        # Cross-thread path: schedule the enqueue and return immediately.  The
+        # old implementation blocked worker threads waiting on send_text(); that
+        # is exactly what wedged final renders when Desktop was slow (#2026-06-09).
         try:
-            from agent.async_utils import safe_schedule_threadsafe
-            fut = safe_schedule_threadsafe(self._safe_send(line), self._loop)
-            if fut is None:
-                self._closed = True
-                return False
-            fut.result(timeout=_WS_WRITE_TIMEOUT_S)
+            self._loop.call_soon_threadsafe(self._enqueue, line, obj, None)
             return not self._closed
-        except concurrent.futures.TimeoutError:  # builtin TimeoutError on 3.11+
-            # The event loop is stalled (GIL-heavy agent turn, delegation
-            # running N children), NOT the socket dead. The send coroutine is
-            # already scheduled and will flush once the loop breathes — latching
-            # _closed here permanently silenced live windows after one slow
-            # write (the "subagent window shows zero streaming" bug). Unblock
-            # the worker thread and keep the transport alive; _safe_send latches
-            # on a real socket error when the frame actually fails.
-            _log.warning(
-                "ws write slow (loop stalled >%ss) peer=%s — frame left in flight",
-                _WS_WRITE_TIMEOUT_S, self._peer,
-            )
-            return not self._closed
-        except Exception as exc:
+        except RuntimeError as exc:
             self._closed = True
             _log.warning(
-                "ws write failed peer=%s error_type=%s error=%s",
+                "ws enqueue failed peer=%s error_type=%s error=%s",
                 self._peer, type(exc).__name__, exc,
             )
             return False
 
     async def write_async(self, obj: dict) -> bool:
-        """Send from the owning event loop. Awaits until the frame is on the wire."""
+        """Send from the owning event loop and confirm delivery."""
         if self._closed:
             return False
-        await self._safe_send(json.dumps(obj, ensure_ascii=False))
-        return not self._closed
+        line = json.dumps(obj, ensure_ascii=False)
+        fut = self._loop.create_future()
+        if not self._enqueue(line, obj, fut):
+            if not fut.done():
+                fut.set_result(False)
+            return False
+        return bool(await fut)
 
-    async def _safe_send(self, line: str) -> None:
+    def _enqueue(self, line: str, obj: dict, fut: asyncio.Future | None) -> bool:
+        if self._closed:
+            if fut is not None and not fut.done():
+                fut.set_result(False)
+            return False
+
+        if _is_droppable_frame(obj) and len(self._queue) >= _WS_QUEUE_SOFT_MAX:
+            self.dropped_frames += 1
+            if fut is not None and not fut.done():
+                fut.set_result(True)
+            return True
+
+        if len(self._queue) >= _WS_QUEUE_HARD_MAX:
+            self._closed = True
+            if fut is not None and not fut.done():
+                fut.set_result(False)
+            return False
+
+        self._queue.append((line, fut))
+        self._ensure_writer()
+        return True
+
+    def _ensure_writer(self) -> None:
+        if self._closed:
+            return
+        if self._writer_task is None or self._writer_task.done():
+            self._writer_task = self._loop.create_task(self._drain_queue())
+
+    async def _drain_queue(self) -> None:
+        while self._queue and not self._closed:
+            line, fut = self._queue.popleft()
+            ok = await self._safe_send(line)
+            if fut is not None and not fut.done():
+                fut.set_result(ok)
+            if not ok:
+                break
+
+    async def _safe_send(self, line: str) -> bool:
         try:
             await self._ws.send_text(line)
+            return True
         except Exception as exc:
             self._closed = True
             _log.warning(
                 "ws send failed peer=%s error_type=%s error=%s",
                 self._peer, type(exc).__name__, exc,
             )
+            return False
 
     def close(self) -> None:
         self._closed = True
+        while self._queue:
+            _, fut = self._queue.popleft()
+            if fut is not None and not fut.done():
+                fut.set_result(False)
 
 
 def _ws_peer_label(ws: Any) -> str:

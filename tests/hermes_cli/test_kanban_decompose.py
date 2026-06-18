@@ -55,6 +55,11 @@ def _patch_extra_body():
     )
 
 
+def _patch_config(*, return_value: dict):
+    """Patch the decomposer's config lookup at its actual use site."""
+    return patch.object(decomp, "_load_config", return_value=return_value)
+
+
 def _patch_list_profiles(names: list[str]):
     """Pretend the named profiles exist. The decomposer uses
     profiles_mod.list_profiles() to build the roster + valid-set, and
@@ -67,10 +72,14 @@ def _patch_list_profiles(names: list[str]):
         )
         for i, n in enumerate(names)
     ]
+    # Patch the lookup site used by kanban_decompose, not just the source module.
+    # In Hermes' test harness other fixtures may monkeypatch hermes_cli.profiles;
+    # patching decomp.profiles_mod keeps these tests scoped to the decomposer's
+    # actual dependency boundary.
     return [
-        patch("hermes_cli.profiles.list_profiles", return_value=fake_profiles),
-        patch("hermes_cli.profiles.profile_exists", side_effect=lambda x: x in names),
-        patch("hermes_cli.profiles.get_active_profile_name", return_value=names[0] if names else "default"),
+        patch.object(decomp.profiles_mod, "list_profiles", return_value=fake_profiles),
+        patch.object(decomp.profiles_mod, "profile_exists", side_effect=lambda x: x in names),
+        patch.object(decomp.profiles_mod, "get_active_profile_name", return_value=names[0] if names else "default"),
     ]
 
 
@@ -127,8 +136,7 @@ def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
-            "hermes_cli.kanban_decompose._load_config",
+        with _patch_aux_client(llm_payload), _patch_extra_body(), _patch_config(
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
             outcome = decomp.decompose_task(tid, author="me")
@@ -169,8 +177,7 @@ def test_decompose_fanout_false_preserves_existing_assignee(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
-            "hermes_cli.kanban_decompose._load_config",
+        with _patch_aux_client(llm_payload), _patch_extra_body(), _patch_config(
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
             outcome = decomp.decompose_task(tid, author="me")
@@ -202,8 +209,7 @@ def test_decompose_fanout_false_uses_valid_llm_assignee(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
-            "hermes_cli.kanban_decompose._load_config",
+        with _patch_aux_client(llm_payload), _patch_extra_body(), _patch_config(
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
             outcome = decomp.decompose_task(tid, author="me")
@@ -234,8 +240,7 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
-            "hermes_cli.kanban_decompose._load_config",
+        with _patch_aux_client(llm_payload), _patch_extra_body(), _patch_config(
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
             outcome = decomp.decompose_task(tid, author="me")
@@ -270,8 +275,7 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
         with patch.dict(
             "os.environ", {}, clear=False,
         ), _patch_aux_client(llm_payload), _patch_extra_body(), \
-            patch(
-                "hermes_cli.kanban_decompose._load_config",
+            _patch_config(
                 return_value={
                     "kanban": {
                         "orchestrator_profile": "orchestrator",

@@ -293,6 +293,94 @@ class TestMaybePersistToolResult:
         )
         assert "Truncated" in result
 
+
+# ── context-mode bridge ───────────────────────────────────────────────
+
+class TestContextModeBridge:
+    """The bridge indexes persisted large tool results into context-mode so they
+    are searchable by content instead of the model re-reading a huge file."""
+
+    def test_indexed_persisted_message_mentions_ctx_search(self):
+        """When ctx- indexing succeeds, the persisted message tells the model
+        the output is now searchable via context-mode."""
+        from tools.tool_result_storage import _build_persisted_message
+        msg = _build_persisted_message(
+            preview="preview text",
+            has_more=True,
+            original_size=200_000,
+            file_path="/tmp/hermes-results/big.txt",
+            ctx_indexed=True,
+        )
+        assert "semantic search" in msg
+        assert "ctx_batch_execute" in msg
+
+    def test_non_indexed_message_omits_ctx_note(self):
+        """When ctx- indexing did NOT happen, no search hint is added."""
+        from tools.tool_result_storage import _build_persisted_message
+        msg = _build_persisted_message(
+            preview="preview text",
+            has_more=False,
+            original_size=500,
+            file_path="/tmp/hermes-results/small.txt",
+            ctx_indexed=False,
+        )
+        assert "ctx_batch_execute" not in msg
+        assert "semantic search" not in msg
+
+    def test_maybe_persist_invokes_bridge_on_success(self):
+        """A successful sandbox write triggers the ctx- bridge indexing call."""
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        with patch("tools.tool_result_storage._index_to_context_mode", return_value=True) as mock_idx:
+            maybe_persist_tool_result(
+                content="x" * 60_000,
+                tool_name="terminal",
+                tool_use_id="tc_bridge",
+                env=env,
+                threshold=30_000,
+            )
+            mock_idx.assert_called_once()
+            # Called with the sandbox path + tool identity
+            call_args = mock_idx.call_args
+            assert "tc_bridge.txt" in call_args[0][0]
+            assert call_args[0][1] == "terminal"
+
+    def test_bridge_failure_does_not_break_persist(self):
+        """If ctx- indexing raises, the persisted message is still returned
+        (sandbox write already succeeded). Tool execution never breaks."""
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        with patch("tools.tool_result_storage._index_to_context_mode", side_effect=RuntimeError("ctx down")):
+            result = maybe_persist_tool_result(
+                content="x" * 60_000,
+                tool_name="terminal",
+                tool_use_id="tc_brk",
+                env=env,
+                threshold=30_000,
+            )
+            # Persistence still succeeded — only the bridge enhancement failed.
+            assert PERSISTED_OUTPUT_TAG in result
+            assert "tc_brk.txt" in result
+
+    def test_bridge_respects_disable_env_flag(self, monkeypatch):
+        """HERMES_CTX_BRIDGE=0 disables the bridge entirely."""
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        monkeypatch.setenv("HERMES_CTX_BRIDGE", "0")
+        from tools.tool_result_storage import _index_to_context_mode
+        # Direct call returns False when disabled
+        assert _index_to_context_mode("/tmp/x.txt", "terminal", "tc1") is False
+
+    def test_bridge_skips_nonexistent_or_remote_paths(self):
+        """Only local files that exist are indexed (remote sandbox paths aren't
+        reachable by the local ctx- binary)."""
+        from tools.tool_result_storage import _index_to_context_mode
+        # Non-existent local path
+        assert _index_to_context_mode("/tmp/does-not-exist-bridge-test.txt", "t", "id") is False
+        # Non-absolute (remote) path
+        assert _index_to_context_mode("relative/path.txt", "t", "id") is False
+
+
     def test_read_file_never_persisted(self):
         """read_file has threshold=inf, should never be persisted."""
         env = MagicMock()
