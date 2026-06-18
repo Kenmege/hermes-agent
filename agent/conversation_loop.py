@@ -635,6 +635,7 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    max_compression_attempts = 3
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     _terminal_error = None
     _terminal_failure_reason = None
@@ -1031,7 +1032,6 @@ def run_conversation(
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
-        max_compression_attempts = 3
 
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
