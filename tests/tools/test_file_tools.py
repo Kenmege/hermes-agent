@@ -464,6 +464,43 @@ class TestSensitivePathCheck:
         result = json.loads(write_file_tool("/tmp/other.txt", "hello"))
         assert result["status"] == "ok"
 
+    @patch("tools.file_tools._get_file_ops")
+    def test_macos_private_var_user_temp_not_blocked(self, mock_get, monkeypatch):
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/home/user/.hermes/config.yaml")
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools.tempfile.gettempdir",
+            lambda: "/private/var/folders/ab/cd/T",
+        )
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {
+            "status": "ok",
+            "path": "/private/var/folders/ab/cd/T/other.txt",
+            "bytes": 5,
+        }
+        mock_ops.write_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import write_file_tool
+        result = json.loads(
+            write_file_tool("/private/var/folders/ab/cd/T/other.txt", "hello")
+        )
+        assert result["status"] == "ok"
+
+    def test_private_var_non_temp_still_blocked(self, monkeypatch):
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/home/user/.hermes/config.yaml")
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools.tempfile.gettempdir",
+            lambda: "/private/var/folders/ab/cd/T",
+        )
+
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool("/private/var/db/system.txt", "evil"))
+        assert "error" in result
+        assert "sensitive system path" in result["error"]
+
 
 class TestPatchSchemaShape:
     """PATCH_SCHEMA must advertise per-mode required params via description

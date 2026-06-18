@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import tempfile
 import threading
 from pathlib import Path
 
@@ -329,6 +330,33 @@ _SENSITIVE_PATH_PREFIXES = (
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
+
+def _is_macos_user_temp_path(*paths: str) -> bool:
+    """Return True when a path is inside macOS' per-user temp directory.
+
+    macOS resolves ``/var/folders/...`` test/user temp paths to
+    ``/private/var/folders/...``.  The system-path write guard blocks
+    ``/private/var`` broadly, but agent file tools must still be able to write
+    to the current user's temporary directory (pytest ``tmp_path``, ACP scratch
+    edits, etc.).  Only the active per-user temp root is exempted — not arbitrary
+    ``/private/var`` paths.
+    """
+    try:
+        temp_root = os.path.realpath(tempfile.gettempdir())
+    except (OSError, ValueError):
+        return False
+    if not temp_root.startswith("/private/var/folders/"):
+        return False
+    for candidate in paths:
+        try:
+            resolved_candidate = os.path.realpath(os.path.normpath(os.path.expanduser(candidate)))
+            if os.path.commonpath([resolved_candidate, temp_root]) == temp_root:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
 
@@ -363,6 +391,8 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     )
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if resolved.startswith(prefix) or normalized.startswith(prefix):
+            if prefix == "/private/var/" and _is_macos_user_temp_path(resolved, normalized):
+                continue
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
