@@ -410,7 +410,7 @@ def test_ledger_rows_that_appear_after_the_scan_still_block_the_copy(homes, monk
         acme.close()
 
 
-@pytest.mark.parametrize("legacy_main", ["rekey", "move"])
+@pytest.mark.parametrize("legacy_main", ["report", "rekey", "move"])
 def test_a_local_receipts_legacy_rows_are_left_to_the_gateway(homes, monkeypatch, legacy_main):
     """A LOCAL session created by the profile's own gateway (multiplex off) is keyed ``agent:main:`` in
     the profile's store, and its creation receipt there binds it to this home: no leaked default chat.
