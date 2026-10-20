@@ -202,11 +202,17 @@ def _map_ssl_cert_file_for_git(git_cmd) -> None:
 
 # Compiled before (preflight) and after (post-pull guard, ZIP gate) every tree move. The first rows
 # are what the launcher and ``hermes_bootstrap`` import before any application code (review G3);
-# test_update_post_pull_syntax_guard derives that set from the real entry paths and pins it here.
+# test_update_post_pull_syntax_guard derives that set from the real entry paths and pins it here,
+# both from their top-level imports and from what a real boot has loaded (the function-local
+# imports the boot reaches, on every platform's branches).
 _UPDATE_CRITICAL_FILES = (
     "hermes_bootstrap.py", "hermes_cli/_parser.py", "hermes_cli/_launchers.py",
     "hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py",
     "hermes_cli/update_handoff.py", "hermes_cli/venv_sync.py", "pm/__init__.py", "pm/environments.py",
+    "pm/paths.py", "pm/filesystem.py", "hermes_cli/steward.py", "hermes_cli/post_update.py",
+    "hermes_cli/runtime_state.py", "hermes_constants_scratch.py", "hermes_constants_scratch_stuck.py",
+    "hermes_platform/__init__.py", "hermes_platform/host/__init__.py", "hermes_platform/host/facts.py",
+    "hermes_platform/host/darwin_pci.py", "hermes_platform/host/runtime.py",
     "hermes_cli/main.py", "hermes_cli/config.py", "hermes_cli/__init__.py",
     "hermes_cli/web_server.py", "cli.py", "run_agent.py", "model_tools.py", "toolsets.py",
     "hermes_constants.py")

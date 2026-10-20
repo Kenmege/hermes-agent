@@ -187,6 +187,94 @@ def test_the_critical_inventory_covers_every_module_the_entry_paths_import_first
     assert entry <= set(update_cmd._UPDATE_CRITICAL_FILES), sorted(entry - set(update_cmd._UPDATE_CRITICAL_FILES))
 
 
+_BOOT_DUMP = "HERMES-BOOT-MODULES="
+
+
+def _booted_checkout_files(root: Path, home: Path) -> set[str]:
+    """The checkout's own files a real launch has imported once ``hermes_bootstrap`` returns.
+
+    Runs the published launcher's own text up to the end of its ``import hermes_bootstrap``
+    block, on this interpreter, with nothing of the caller's environment: a clean data root,
+    a home under it and the platform locations under it, so every run boots the same way.
+    The dump is every loaded module's file, kept when it lies in the checkout and outside any
+    ``site-packages``/``dist-packages`` and the interpreter's stdlib -- by path, not by name.
+    """
+    import json
+    import os
+    import sysconfig
+
+    from hermes_cli import _launchers
+
+    lines = _launchers._launcher_script("hermes", root, None).splitlines(keepends=True)
+    start = next(n for n, line in enumerate(lines) if line.strip() == "import hermes_bootstrap")
+    end = start + 1
+    while end < len(lines) and (lines[end][:1].isspace() or lines[end].startswith(("except", "finally"))):
+        end += 1
+    probe = "".join(lines[:end]) + (
+        "import json as _boot_json\n"
+        "_boot_files = {m.__file__ for m in list(sys.modules.values())"
+        " if isinstance(getattr(m, '__file__', None), str)}\n"
+        f"print({_BOOT_DUMP!r} + _boot_json.dumps(sorted(_boot_files)))\n")
+    user = home.parent
+    env = {"HERMES_HOME": str(home), "HOME": str(user), "PATH": os.defpath,
+           "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"}
+    if os.name == "nt":
+        env.update(SYSTEMROOT=os.environ.get("SYSTEMROOT", r"C:\Windows"), USERPROFILE=str(user),
+                   LOCALAPPDATA=str(user / "AppData" / "Local"), APPDATA=str(user / "AppData" / "Roaming"),
+                   TEMP=str(user), TMP=str(user))
+    # Run from a file, as a published launcher is run. ``-I`` keeps the file's directory off
+    # sys.path, exactly as it keeps it off for ``-c``.
+    script = user / "launcher-boot-probe.py"
+    script.write_text(probe, encoding="utf-8")
+    result = subprocess.run([sys.executable, "-I", str(script)], cwd=user, env=env, capture_output=True,
+                            text=True, encoding="utf-8", timeout=120, check=False)
+    dumps = [line for line in result.stdout.splitlines() if line.startswith(_BOOT_DUMP)]
+    assert result.returncode == 0 and dumps, result.stdout + result.stderr
+    outside = [Path(sysconfig.get_paths()[key]).resolve() for key in ("stdlib", "platstdlib", "purelib", "platlib")]
+    booted = set()
+    for name in json.loads(dumps[-1][len(_BOOT_DUMP):]):
+        path = Path(name).resolve()
+        if not path.is_relative_to(root) or any(path.is_relative_to(other) for other in outside):
+            continue
+        relative = path.relative_to(root)
+        if not {"site-packages", "dist-packages"} & set(relative.parts):
+            booted.add(relative.as_posix())
+    return booted
+
+
+@pytest.mark.platforms("any")
+@pytest.mark.parametrize("state", ["fresh", "committed"])
+def test_the_critical_inventory_covers_every_module_a_real_boot_imports(tmp_path, monkeypatch, state):
+    """The one-level parse above cannot see a module the boot reaches through a function-local
+    import: for example ``pm.paths`` is imported function-locally by
+    ``pm.environments.store_root``, which the launcher path reaches on every launch, and the
+    inventory missed it, so a target that broke only that file passed the pre-move syntax check.
+    Boot for real and compare what was loaded, both boot branches: a data root with no state for
+    the checkout, and one with a committed dependency generation. Every platform run checks
+    its own branches, so the inventory holds their union.
+    """
+    import json
+
+    from pm.environments import install_state_dir, site_packages
+
+    root = Path(update_cmd.__file__).resolve().parents[1]
+    home = tmp_path / "user" / ".hermes"
+    home.mkdir(parents=True)
+    if state == "committed":
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        selected = install_state_dir(root) / "environments" / "selected" / "venv"
+        site_packages(selected).mkdir(parents=True)
+        (selected / "pyvenv.cfg").write_text("home = fixture\n", encoding="utf-8")
+        (install_state_dir(root) / "facts.json").write_text(
+            json.dumps({"packages": {"venv": {"environment": str(selected)}}}), encoding="utf-8")
+
+    booted = _booted_checkout_files(root, home)
+
+    assert {"hermes_bootstrap.py", "pm/environments.py"} <= booted, sorted(booted)
+    assert ("hermes_cli/runtime_state.py" in booted) is (state == "committed"), sorted(booted)
+    assert booted <= set(update_cmd._UPDATE_CRITICAL_FILES), sorted(booted - set(update_cmd._UPDATE_CRITICAL_FILES))
+
+
 def test_a_malformed_bootstrap_is_refused_before_the_move(tmp_path):
     """The preflight reads the real inventory from the target commit: a broken bootstrap refuses."""
     from hermes_cli import update_cmd_commit as commit
