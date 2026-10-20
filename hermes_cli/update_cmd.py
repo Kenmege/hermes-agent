@@ -202,9 +202,9 @@ def _map_ssl_cert_file_for_git(git_cmd) -> None:
 
 # Compiled before (preflight) and after (post-pull guard, ZIP gate) every tree move. The first rows
 # are what the launcher and ``hermes_bootstrap`` import before any application code (review G3);
-# test_update_post_pull_syntax_guard derives that set from the real entry paths and pins it here,
-# both from their top-level imports and from what a real boot has loaded (the function-local
-# imports the boot reaches, on every platform's branches).
+# test_update_post_pull_syntax_guard derives that set from the real entry paths and pins it here;
+# its boot test also collects the modules loaded through completion of the bootstrap import in
+# clean fresh/committed fixtures on the host OS, against a disposable copy of the checkout.
 _UPDATE_CRITICAL_FILES = (
     "hermes_bootstrap.py", "hermes_cli/_parser.py", "hermes_cli/_launchers.py",
     "hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py",

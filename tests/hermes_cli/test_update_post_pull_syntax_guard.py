@@ -190,14 +190,52 @@ def test_the_critical_inventory_covers_every_module_the_entry_paths_import_first
 _BOOT_DUMP = "HERMES-BOOT-MODULES="
 
 
-def _booted_checkout_files(root: Path, home: Path) -> set[str]:
-    """The checkout's own files a real launch has imported once ``hermes_bootstrap`` returns.
+def _disposable_checkout(source: Path, destination: Path) -> Path:
+    """A disposable copy of the real boot sources, with no inherited install state.
 
-    Runs the published launcher's own text up to the end of its ``import hermes_bootstrap``
-    block, on this interpreter, with nothing of the caller's environment: a clean data root,
-    a home under it and the platform locations under it, so every run boots the same way.
-    The dump is every loaded module's file, kept when it lies in the checkout and outside any
-    ``site-packages``/``dist-packages`` and the interpreter's stdlib -- by path, not by name.
+    Copies the checkout's root modules and its ``hermes_cli``, ``pm`` and
+    ``hermes_platform`` packages, plus ``pyproject.toml`` (and PM's lockfile when
+    present), from ``source`` -- never the checkout the suite runs from as a boot
+    target. Only ``.py`` sources are copied, so no install stamp, update or
+    recovery marker, launch artifact or bytecode can be inherited; the empty
+    ``.git`` directory is the controlled checkout metadata the boot checks for.
+    """
+    import shutil
+
+    destination.mkdir(parents=True)
+    sources = list(source.glob("*.py"))
+    for package in ("hermes_cli", "pm", "hermes_platform"):
+        sources.extend(
+            path for path in (source / package).rglob("*.py")
+            if "__pycache__" not in path.parts)
+    for path in sources:
+        target = destination / path.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+    shutil.copy2(source / "pyproject.toml", destination / "pyproject.toml")
+    lockfile = source / "pm" / "lock.json"
+    if lockfile.is_file():
+        shutil.copy2(lockfile, destination / "pm" / "lock.json")
+    (destination / ".git").mkdir()
+    assert not (destination / "install-stamp.json").exists()
+    assert not (destination / ".hermes-update-zip-swap").exists()
+    assert not (destination / ".git" / "hermes-update-pull").exists()
+    return destination
+
+
+def _booted_checkout_files(root: Path, home: Path) -> set[str]:
+    """The disposable checkout's files loaded through completion of the bootstrap import.
+
+    Runs the published launcher's own text, generated for the disposable ``root``,
+    up to the end of its ``import hermes_bootstrap`` block, on this interpreter,
+    with nothing of the caller's environment: a clean data root, a home under it
+    and the platform locations under it, so every run boots the same way.
+    The dump is every loaded module's file, kept when it lies in that disposable
+    checkout and outside any ``site-packages``/``dist-packages`` and the
+    interpreter's stdlib -- by path, not by name. ``-B`` is passed explicitly
+    alongside ``-I`` (which ignores ``PYTHONDONTWRITEBYTECODE``), and UTF-8 mode
+    is requested with the explicit ``-X utf8`` interpreter option, so the child
+    cannot write bytecode into any checkout.
     """
     import json
     import os
@@ -216,17 +254,17 @@ def _booted_checkout_files(root: Path, home: Path) -> set[str]:
         " if isinstance(getattr(m, '__file__', None), str)}\n"
         f"print({_BOOT_DUMP!r} + _boot_json.dumps(sorted(_boot_files)))\n")
     user = home.parent
-    env = {"HERMES_HOME": str(home), "HOME": str(user), "PATH": os.defpath,
-           "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"}
+    env = {"HERMES_HOME": str(home), "HOME": str(user), "PATH": os.defpath}
     if os.name == "nt":
         env.update(SYSTEMROOT=os.environ.get("SYSTEMROOT", r"C:\Windows"), USERPROFILE=str(user),
                    LOCALAPPDATA=str(user / "AppData" / "Local"), APPDATA=str(user / "AppData" / "Roaming"),
                    TEMP=str(user), TMP=str(user))
     # Run from a file, as a published launcher is run. ``-I`` keeps the file's directory off
-    # sys.path, exactly as it keeps it off for ``-c``.
+    # sys.path, exactly as it keeps it off for ``-c``; ``-B`` (not an environment
+    # variable, which ``-I`` ignores) keeps bytecode out of the disposable tree.
     script = user / "launcher-boot-probe.py"
     script.write_text(probe, encoding="utf-8")
-    result = subprocess.run([sys.executable, "-I", str(script)], cwd=user, env=env, capture_output=True,
+    result = subprocess.run([sys.executable, "-I", "-B", "-X", "utf8", str(script)], cwd=user, env=env, capture_output=True,
                             text=True, encoding="utf-8", timeout=120, check=False)
     dumps = [line for line in result.stdout.splitlines() if line.startswith(_BOOT_DUMP)]
     assert result.returncode == 0 and dumps, result.stdout + result.stderr
@@ -245,19 +283,24 @@ def _booted_checkout_files(root: Path, home: Path) -> set[str]:
 @pytest.mark.platforms("any")
 @pytest.mark.parametrize("state", ["fresh", "committed"])
 def test_the_critical_inventory_covers_every_module_a_real_boot_imports(tmp_path, monkeypatch, state):
-    """The one-level parse above cannot see a module the boot reaches through a function-local
-    import: for example ``pm.paths`` is imported function-locally by
-    ``pm.environments.store_root``, which the launcher path reaches on every launch, and the
-    inventory missed it, so a target that broke only that file passed the pre-move syntax check.
-    Boot for real and compare what was loaded, both boot branches: a data root with no state for
-    the checkout, and one with a committed dependency generation. Every platform run checks
-    its own branches, so the inventory holds their union.
+    """The existing inventory test walks imports in the launcher and bootstrap source, but
+    does not follow transitive imports inside the modules they load: for example
+    ``pm.paths`` is reached through ``prepare_launch`` -> ``read_install_stamp`` ->
+    ``pm.paths``, and the inventory missed it, so a target that broke only that
+    file passed the pre-move syntax check. This test collects modules loaded
+    through completion of the bootstrap import in clean fresh/committed fixtures
+    on the host OS, booting a disposable copy of the checkout under ``tmp_path``
+    so the probe can never mutate the checkout or installation it runs from.
+    The disposable copy carries no install stamp, so ``prepare_launch`` still
+    takes its unstamped-source branch (``hermes_cli/post_update.py`` is loaded)
+    without any mock or disable flag.
     """
     import json
 
     from pm.environments import install_state_dir, site_packages
 
-    root = Path(update_cmd.__file__).resolve().parents[1]
+    source = Path(update_cmd.__file__).resolve().parents[1]
+    root = _disposable_checkout(source, tmp_path / "checkout")
     home = tmp_path / "user" / ".hermes"
     home.mkdir(parents=True)
     if state == "committed":
@@ -271,6 +314,7 @@ def test_the_critical_inventory_covers_every_module_a_real_boot_imports(tmp_path
     booted = _booted_checkout_files(root, home)
 
     assert {"hermes_bootstrap.py", "pm/environments.py"} <= booted, sorted(booted)
+    assert "hermes_cli/post_update.py" in booted, sorted(booted)
     assert ("hermes_cli/runtime_state.py" in booted) is (state == "committed"), sorted(booted)
     assert booted <= set(update_cmd._UPDATE_CRITICAL_FILES), sorted(booted - set(update_cmd._UPDATE_CRITICAL_FILES))
 
