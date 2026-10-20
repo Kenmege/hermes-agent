@@ -18,6 +18,9 @@ from hermes_cli.update_inventory import UpdatePlan
 from hermes_cli.update_cmd import _sync_with_upstream_if_needed
 
 
+pytestmark = pytest.mark.usefixtures("git_fetch_through_subprocess_run")
+
+
 def git(root, *args):
     return subprocess.run(['git', *args], cwd=root, check=True, capture_output=True,
                           text=True, encoding='utf-8').stdout.strip()

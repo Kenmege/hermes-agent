@@ -31,7 +31,9 @@ from hermes_constants import get_hermes_home
 import hermes_cli.update_host_obligation as host_obligation
 from gateway import host_rendezvous
 
-pytestmark = pytest.mark.usefixtures("isolated_source_completion")
+pytestmark = pytest.mark.usefixtures(
+    "isolated_source_completion", "git_fetch_through_subprocess_run",
+)
 
 
 def _make_up_to_date_side_effect(sha="abc123"):

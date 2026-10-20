@@ -129,6 +129,28 @@ def _discharge_host_update_obligation():
 
 
 @pytest.fixture
+def git_fetch_through_subprocess_run(monkeypatch):
+    """Keep the updater's fd-less ``git fetch`` on the test's ``subprocess.run`` seam.
+
+    On macOS, custody uses ``Popen`` under an owner watchdog, bypassing a test's
+    ``subprocess.run`` double. Opt-in tests route that path through the same seam
+    on every OS. Linux and Windows do not use this path and are unaffected.
+    """
+    import subprocess
+
+    from hermes_cli import update_custody
+
+    monkeypatch.setattr(
+        update_custody,
+        "_run_owner_watched",
+        lambda argv, kwargs: subprocess.run(
+            list(argv), check=kwargs.get("check", False),
+            **{key: value for key, value in kwargs.items() if key != "check"},
+        ),
+    )
+
+
+@pytest.fixture
 def isolated_source_completion(monkeypatch):
     """Unit-test the completion tail in-process; real transport is tested separately."""
     from hermes_cli import update_cmd, update_completion
