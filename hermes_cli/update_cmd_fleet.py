@@ -1427,24 +1427,6 @@ def _restart_systemd_gateway_units(
             restarted_scoped_units.update(f"{scope}/{name}" for name in restarted_services[_scope_mark:])
 
 
-def _unit_main_pid(scope_cmd: list, svc_name: str) -> int:
-    """Live ``MainPID`` of a unit; ``0`` when inactive, unprivileged or unreadable.
-
-    Property reads need no manage-units privileges, and an unreadable PID is never collapsed:
-    identity that cannot be proved keeps its own restart.
-    """
-    try:
-        result = _systemctl(list(scope_cmd) + ["show", svc_name, "--property=MainPID", "--value"], timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return 0
-    if getattr(result, "returncode", 1) != 0:
-        return 0
-    try:
-        return int((getattr(result, "stdout", "") or "").strip() or 0)
-    except ValueError:
-        return 0
-
-
 @dataclass
 class _GatewayRestartOutcome:
     """Restart-phase bookkeeping. ``restarted_services`` keeps bare unit names (fleet
