@@ -1240,6 +1240,10 @@ def _set_wal_with_busy_convergence(conn: sqlite3.Connection):
             return ("wal",)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            # A peer may have committed WAL between the probe above and the
+            # deadline check. Accept that transition before reporting BUSY.
+            if _on_disk_journal_mode(conn) == "wal":
+                return ("wal",)
             assert last_busy is not None
             raise last_busy
         time.sleep(

@@ -174,6 +174,50 @@ class TestApplyWalWithFallback:
         assert calls == ["PRAGMA journal_mode=WAL"]
         assert not any("journal_mode=DELETE" in sql for sql in calls)
 
+    def test_busy_setter_accepts_peer_wal_at_deadline(self, tmp_path, monkeypatch):
+        """Re-probe a transiently unreadable mode before reporting timeout."""
+        target = tmp_path / "deadline.db"
+        peer = sqlite3.connect(str(target), isolation_level=None)
+        peer.execute("CREATE TABLE t (x INTEGER)")
+        attempts = [0]
+        probes = [0]
+
+        class _BusyConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):
+                if sql == "PRAGMA journal_mode=WAL":
+                    attempts[0] += 1
+                    raise sqlite3.OperationalError("database is locked")
+                if sql == "PRAGMA journal_mode":
+                    probes[0] += 1
+                    if probes[0] == 1:
+                        raise sqlite3.OperationalError("database is locked")
+                return super().execute(sql, *args, **kwargs)
+
+        conn = sqlite3.connect(
+            str(target), factory=_BusyConnection, isolation_level=None
+        )
+        clock_reads = 0
+
+        def clock():
+            nonlocal clock_reads
+            clock_reads += 1
+            if clock_reads == 1:
+                return 0.0
+            # The first mode probe was unreadable. Publish the peer's real WAL
+            # transition as the setter observes that its budget expired.
+            assert peer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+            return 2.0
+
+        monkeypatch.setattr(hermes_state.time, "monotonic", clock)
+        try:
+            assert hermes_state._set_wal_with_busy_convergence(conn) == ("wal",)
+            assert attempts[0] == 1
+            conn.execute("INSERT INTO t VALUES (1)")
+            assert peer.execute("SELECT x FROM t").fetchall() == [(1,)]
+        finally:
+            conn.close()
+            peer.close()
+
     def test_sqlite_locked_is_not_retried_as_busy(self, monkeypatch):
         """SQLITE_LOCKED is not the cross-connection convergence race."""
         attempts = [0]
